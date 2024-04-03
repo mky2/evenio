@@ -1,7 +1,8 @@
 //! Accessing components on entities.
 
 use alloc::format;
-use core::iter::FusedIterator;
+use core::iter::{zip, FusedIterator};
+use core::mem::MaybeUninit;
 use core::ptr::NonNull;
 use core::{any, fmt};
 
@@ -98,6 +99,41 @@ impl<Q: Query> FetcherState<Q> {
     }
 
     #[inline]
+    pub(crate) unsafe fn get_many_mut<const N: usize>(
+        &mut self,
+        world_entities: &Entities,
+        entities: [EntityId; N],
+    ) -> Result<[Q::Item<'_>; N], GetError> {
+        assert!(!core::mem::needs_drop::<Q::Item<'_>>());
+
+        for i in 0..N {
+            for j in 0..i {
+                if entities[i] == entities[j] {
+                    return Err(GetError::AliasedMutability);
+                }
+            }
+        }
+
+        let mut results = [(); N].map(|()| MaybeUninit::uninit());
+
+        for (result, entity) in zip(&mut results, entities) {
+            let Some(loc) = world_entities.get(entity) else {
+                return Err(GetError::NoSuchEntity);
+            };
+
+            assume_debug_checked(loc.archetype != ArchetypeIdx::NULL);
+
+            let Some(state) = self.map.get_mut(loc.archetype) else {
+                return Err(GetError::QueryDoesNotMatch);
+            };
+
+            *result = MaybeUninit::new(Q::get(state, loc.row));
+        }
+
+        Ok(results.map(|r| r.assume_init()))
+    }
+
+    #[inline]
     pub(crate) unsafe fn get_by_location_mut(&mut self, loc: EntityLocation) -> Q::Item<'_> {
         let state = self
             .map
@@ -105,8 +141,6 @@ impl<Q: Query> FetcherState<Q> {
             .expect_debug_checked("invalid entity location");
         Q::get(state, loc.row)
     }
-
-    // TODO: get_many_mut
 
     #[inline]
     pub(crate) unsafe fn iter<'a>(&'a self, archetypes: &'a Archetypes) -> Iter<'a, Q>
@@ -232,6 +266,18 @@ impl<'a, Q: Query> Fetcher<'a, Q> {
     #[inline]
     pub fn get_mut(&mut self, entity: EntityId) -> Result<Q::Item<'_>, GetError> {
         unsafe { self.state.get_mut(self.world.entities(), entity) }
+    }
+
+    /// Returns the query item for the given entities.
+    ///
+    /// If one of the entities doesn't exist or doesn't match the query,
+    /// or the entities are not pairwise distinct, then a [`GetError`] is returned.
+    #[inline]
+    pub fn get_many_mut<const N: usize>(
+        &mut self,
+        entities: [EntityId; N],
+    ) -> Result<[Q::Item<'_>; N], GetError> {
+        unsafe { self.state.get_many_mut(self.world.entities(), entities) }
     }
 
     /// Returns an iterator over all entities matching the read-only query.
@@ -768,6 +814,73 @@ mod tests {
         });
 
         world.send(E3);
+    }
+
+    #[test]
+    fn fetch_mut() {
+        let mut world = World::new();
+
+        let e = world.spawn();
+
+        world.insert(e, C1(123));
+
+        world.add_handler(move |_: Receiver<E1>, mut f: Fetcher<&mut C1>| {
+            let c = f.get_mut(e).unwrap();
+            c.0 += 456;
+        });
+
+        world.add_handler(move |_: Receiver<E2>, f: Fetcher<&C1>| {
+            assert_eq!(f.get(e), Ok(&C1(123 + 456)));
+        });
+
+        world.add_handler(move |_: Receiver<E3>, f: Fetcher<&C1>| {
+            assert_ne!(f.get(e), Ok(&C1(123 + 456)));
+        });
+
+        world.send(E3);
+        world.send(E1);
+        world.send(E2);
+    }
+
+    #[test]
+    fn fetch_many_mut() {
+        let mut world = World::new();
+
+        let e1 = world.spawn();
+        let e2 = world.spawn();
+
+        world.insert(e1, C1(1));
+        world.insert(e2, C1(2));
+
+        world.add_handler(move |_: Receiver<E1>, mut f: Fetcher<&mut C1>| {
+            let [c1, c2] = f.get_many_mut([e1, e2]).unwrap();
+            c1.0 += 1;
+            c2.0 += 2;
+        });
+
+        world.add_handler(move |_: Receiver<E2>, f: Fetcher<&C1>| {
+            assert_eq!(f.get(e1), Ok(&C1(2)));
+            assert_eq!(f.get(e2), Ok(&C1(4)));
+        });
+
+        world.send(E1);
+        world.send(E2);
+    }
+
+    #[test]
+    #[should_panic(expected = "violate aliasing rule")]
+    fn fetch_many_mut_same_entity() {
+        let mut world = World::new();
+
+        let e = world.spawn();
+
+        world.insert(e, C1(1));
+
+        world.add_handler(move |_: Receiver<E1>, mut f: Fetcher<&mut C1>| {
+            f.get_many_mut([e, e]).expect("violate aliasing rule");
+        });
+
+        world.send(E1);
     }
 
     #[test]

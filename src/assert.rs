@@ -16,7 +16,11 @@ const _: () = assert!(
 
 /// Extension trait for checked array indexing with checks removed in release
 /// mode.
-pub(crate) trait GetDebugChecked<Idx> {
+///
+/// # Safety
+///
+/// `get_debug_checked_mut`: exclusive mutability must be maintained for distinct indices.
+pub(crate) unsafe trait GetDebugChecked<Idx> {
     type Output: ?Sized;
 
     /// Gets a reference to the element at the given index.
@@ -41,7 +45,7 @@ pub(crate) trait GetDebugChecked<Idx> {
     unsafe fn get_debug_checked_mut(&mut self, idx: Idx) -> &mut Self::Output;
 }
 
-impl<T, I> GetDebugChecked<I> for [T]
+unsafe impl<T, I> GetDebugChecked<I> for [T]
 where
     I: SliceIndex<[T]>,
 {
@@ -65,7 +69,7 @@ where
 }
 
 // Don't use `Slab::get_unchecked` because there's a panicking branch. https://github.com/tokio-rs/slab/pull/74
-impl<T> GetDebugChecked<usize> for Slab<T> {
+unsafe impl<T> GetDebugChecked<usize> for Slab<T> {
     type Output = T;
 
     #[inline]
